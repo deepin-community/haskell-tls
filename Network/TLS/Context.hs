@@ -63,6 +63,8 @@ module Network.TLS.Context
     , getHState
     , getStateRNG
     , tls13orLater
+    , getFinished
+    , getPeerFinished
     ) where
 
 import Network.TLS.Backend
@@ -72,6 +74,9 @@ import Network.TLS.Struct13
 import Network.TLS.State
 import Network.TLS.Hooks
 import Network.TLS.Record.State
+import Network.TLS.Record.Layer
+import Network.TLS.Record.Reading
+import Network.TLS.Record.Writing
 import Network.TLS.Parameters
 import Network.TLS.Measurement
 import Network.TLS.Types (Role(..))
@@ -157,12 +162,15 @@ contextNew backend params = liftIO $ do
     lockWrite <- newMVar ()
     lockRead  <- newMVar ()
     lockState <- newMVar ()
+    finished <- newIORef Nothing
+    peerFinished <- newIORef Nothing
 
-    return Context
+    let ctx = Context
             { ctxConnection   = getBackend backend
             , ctxShared       = shared
             , ctxSupported    = supported
             , ctxState        = stvar
+            , ctxFragmentSize = Just 16384
             , ctxTxState      = tx
             , ctxRxState      = rx
             , ctxHandshake    = hs
@@ -182,7 +190,24 @@ contextNew backend params = liftIO $ do
             , ctxPendingActions   = as
             , ctxCertRequests     = crs
             , ctxKeyLogger        = debugKeyLogger debug
+            , ctxRecordLayer      = recordLayer
+            , ctxHandshakeSync    = HandshakeSync syncNoOp syncNoOp
+            , ctxQUICMode         = False
+            , ctxFinished         = finished
+            , ctxPeerFinished     = peerFinished
             }
+
+        syncNoOp _ _ = return ()
+
+        recordLayer = RecordLayer
+            { recordEncode    = encodeRecord ctx
+            , recordEncode13  = encodeRecord13 ctx
+            , recordSendBytes = sendBytes ctx
+            , recordRecv      = recvRecord ctx
+            , recordRecv13    = recvRecord13 ctx
+            }
+
+    return ctx
 
 -- | create a new context on an handle.
 contextNewOnHandle :: (MonadIO m, TLSParams params)
@@ -217,3 +242,11 @@ contextHookSetCertificateRecv context f =
 contextHookSetLogging :: Context -> Logging -> IO ()
 contextHookSetLogging context loggingCallbacks =
     contextModifyHooks context (\hooks -> hooks { hookLogging = loggingCallbacks })
+
+-- | Get TLS Finished sent to peer
+getFinished :: Context -> IO (Maybe FinishedData)
+getFinished = readIORef . ctxFinished
+
+-- | Get TLS Finished received from peer
+getPeerFinished :: Context -> IO (Maybe FinishedData)
+getPeerFinished = readIORef . ctxPeerFinished

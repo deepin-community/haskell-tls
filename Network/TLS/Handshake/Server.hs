@@ -28,6 +28,7 @@ import Network.TLS.Util (bytesEq, catchException, fromJust)
 import Network.TLS.IO
 import Network.TLS.Types
 import Network.TLS.State
+import Network.TLS.Handshake.Control
 import Network.TLS.Handshake.State
 import Network.TLS.Handshake.Process
 import Network.TLS.Handshake.Key
@@ -141,11 +142,6 @@ handshakeServerWith sparams ctx clientHello@(ClientHello legacyVersion _ clientS
             _                    -> Nothing
     maybe (return ()) (usingState_ ctx . setClientSNI) serverName
 
-    -- ALPN (Application Layer Protocol Negotiation)
-    case extensionLookup extensionID_ApplicationLayerProtocolNegotiation exts >>= extensionDecode MsgTClientHello of
-        Just (ApplicationLayerProtocolNegotiation protos) -> usingState_ ctx $ setClientALPNSuggest protos
-        _ -> return ()
-
     -- TLS version dependent
     if chosenVersion <= TLS12 then
         handshakeServerWithTLS12 sparams ctx chosenVersion exts ciphers serverName clientVersion compressions clientSession
@@ -169,7 +165,7 @@ handshakeServerWithTLS12 :: ServerParams
                          -> IO ()
 handshakeServerWithTLS12 sparams ctx chosenVersion exts ciphers serverName clientVersion compressions clientSession = do
     extraCreds <- onServerNameIndication (serverHooks sparams) serverName
-    let allCreds = filterCredentials (isCredentialAllowed chosenVersion) $
+    let allCreds = filterCredentials (isCredentialAllowed chosenVersion exts) $
                        extraCreds `mappend` sharedCredentials (ctxShared ctx)
 
     -- If compression is null, commonCompressions should be [0].
@@ -368,7 +364,8 @@ doHandshake sparams mcred ctx chosenVersion usedCipher usedCompression clientSes
                       -- field of this extension SHALL be empty.
                       Just _  -> return [ ExtensionRaw extensionID_ServerName ""]
                       Nothing -> return []
-            let extensions = secRengExt ++ emsExt ++ protoExt ++ sniExt
+            let extensions = sharedHelloExtensions (serverShared sparams)
+                          ++ secRengExt ++ emsExt ++ protoExt ++ sniExt
             usingState_ ctx (setVersion chosenVersion)
             usingHState ctx $ setServerHelloParameters chosenVersion srand usedCipher usedCompression
             return $ ServerHello chosenVersion srand session (cipherID usedCipher)
@@ -601,9 +598,18 @@ filterSortCredentials rankFun (Credentials creds) =
     let orderedPairs = sortOn fst [ (rankFun cred, cred) | cred <- creds ]
      in Credentials [ cred | (Just _, cred) <- orderedPairs ]
 
-isCredentialAllowed :: Version -> Credential -> Bool
-isCredentialAllowed ver cred = pubkey `versionCompatible` ver
-  where (pubkey, _) = credentialPublicPrivateKeys cred
+isCredentialAllowed :: Version -> [ExtensionRaw] -> Credential -> Bool
+isCredentialAllowed ver exts cred =
+    pubkey `versionCompatible` ver && satisfiesEcPredicate p pubkey
+  where
+    (pubkey, _) = credentialPublicPrivateKeys cred
+    -- ECDSA keys are tested against supported elliptic curves until TLS12 but
+    -- not after.  With TLS13, the curve is linked to the signature algorithm
+    -- and client support is tested with signatureCompatible13.
+    p | ver < TLS13 = case extensionLookup extensionID_NegotiatedGroups exts >>= extensionDecode MsgTClientHello of
+          Nothing                    -> const True
+          Just (NegotiatedGroups sg) -> (`elem` sg)
+      | otherwise   = const True
 
 -- Filters a list of candidate credentials with credentialMatchesHashSignatures.
 --
@@ -712,13 +718,13 @@ doHandshake13 sparams ctx chosenVersion usedCipher exts usedHash clientKeyShare 
     (psk, binderInfo, is0RTTvalid) <- choosePSK
     earlyKey <- calculateEarlySecret ctx choice (Left psk) True
     let earlySecret = pairBase earlyKey
-        ClientTrafficSecret clientEarlySecret = pairClient earlyKey
+        clientEarlySecret = pairClient earlyKey
     extensions <- checkBinder earlySecret binderInfo
     hrr <- usingState_ ctx getTLS13HRR
     let authenticated = isJust binderInfo
         rtt0OK = authenticated && not hrr && rtt0 && rtt0accept && is0RTTvalid
     extraCreds <- usingState_ ctx getClientSNI >>= onServerNameIndication (serverHooks sparams)
-    let allCreds = filterCredentials (isCredentialAllowed chosenVersion) $
+    let allCreds = filterCredentials (isCredentialAllowed chosenVersion exts) $
                        extraCreds `mappend` sharedCredentials (ctxShared ctx)
     ----------------------------------------------------------------
     established <- ctxEstablished ctx
@@ -738,32 +744,43 @@ doHandshake13 sparams ctx chosenVersion usedCipher exts usedHash clientKeyShare 
     mCredInfo <- if authenticated then return Nothing else decideCredentialInfo allCreds
     (ecdhe,keyShare) <- makeServerKeyShare ctx clientKeyShare
     ensureRecvComplete ctx
-    (clientHandshakeSecret, handshakeSecret) <- runPacketFlight ctx $ do
+    (clientHandshakeSecret, handSecret) <- runPacketFlight ctx $ do
         sendServerHello keyShare srand extensions
         sendChangeCipherSpec13 ctx
     ----------------------------------------------------------------
         handKey <- liftIO $ calculateHandshakeSecret ctx choice earlySecret ecdhe
-        let ServerTrafficSecret serverHandshakeSecret = triServer handKey
-            ClientTrafficSecret clientHandshakeSecret = triClient handKey
+        let serverHandshakeSecret = triServer handKey
+            clientHandshakeSecret = triClient handKey
+            handSecret = triBase handKey
         liftIO $ do
-            setRxState ctx usedHash usedCipher $ if rtt0OK then clientEarlySecret else clientHandshakeSecret
+            if rtt0OK && not (ctxQUICMode ctx)
+                then setRxState ctx usedHash usedCipher clientEarlySecret
+                else setRxState ctx usedHash usedCipher clientHandshakeSecret
             setTxState ctx usedHash usedCipher serverHandshakeSecret
+            let mEarlySecInfo
+                 | rtt0OK      = Just $ EarlySecretInfo usedCipher clientEarlySecret
+                 | otherwise   = Nothing
+                handSecInfo = HandshakeSecretInfo usedCipher (clientHandshakeSecret,serverHandshakeSecret)
+            contextSync ctx $ SendServerHello exts mEarlySecInfo handSecInfo
     ----------------------------------------------------------------
         sendExtensions rtt0OK protoExt
         case mCredInfo of
             Nothing              -> return ()
             Just (cred, hashSig) -> sendCertAndVerify cred hashSig
-        rawFinished <- makeFinished ctx usedHash serverHandshakeSecret
+        let ServerTrafficSecret shs = serverHandshakeSecret
+        rawFinished <- makeFinished ctx usedHash shs
         loadPacket13 ctx $ Handshake13 [rawFinished]
-        return (clientHandshakeSecret, triBase handKey)
+        return (clientHandshakeSecret, handSecret)
     sfSentTime <- getCurrentTimeFromBase
     ----------------------------------------------------------------
     hChSf <- transcriptHash ctx
-    appKey <- calculateApplicationSecret ctx choice handshakeSecret hChSf
-    let ClientTrafficSecret clientApplicationSecret0 = triClient appKey
-        ServerTrafficSecret serverApplicationSecret0 = triServer appKey
+    appKey <- calculateApplicationSecret ctx choice handSecret hChSf
+    let clientApplicationSecret0 = triClient appKey
+        serverApplicationSecret0 = triServer appKey
         applicationSecret = triBase appKey
     setTxState ctx usedHash usedCipher serverApplicationSecret0
+    let appSecInfo = ApplicationSecretInfo (clientApplicationSecret0,serverApplicationSecret0)
+    contextSync ctx $ SendServerFinished appSecInfo
     ----------------------------------------------------------------
     if rtt0OK then
         setEstablished ctx (EarlyDataAllowed rtt0max)
@@ -771,7 +788,8 @@ doHandshake13 sparams ctx chosenVersion usedCipher exts usedHash clientKeyShare 
         setEstablished ctx (EarlyDataNotAllowed 3) -- hardcoding
 
     let expectFinished hChBeforeCf (Finished13 verifyData) = liftIO $ do
-            checkFinished usedHash clientHandshakeSecret hChBeforeCf verifyData
+            let ClientTrafficSecret chs = clientHandshakeSecret
+            checkFinished ctx usedHash chs hChBeforeCf verifyData
             handshakeTerminate13 ctx
             setRxState ctx usedHash usedCipher clientApplicationSecret0
             sendNewSessionTicket applicationSecret sfSentTime
@@ -787,7 +805,7 @@ doHandshake13 sparams ctx chosenVersion usedCipher exts usedHash clientKeyShare 
           unless skip $ recvHandshake13hash ctx (expectCertVerify sparams ctx)
           recvHandshake13hash ctx expectFinished
           ensureRecvComplete ctx
-      else if rtt0OK then
+      else if rtt0OK && not (ctxQUICMode ctx) then
         setPendingActions ctx [PendingAction True expectEndOfEarlyData
                               ,PendingActionHash True expectFinished]
       else
@@ -918,8 +936,14 @@ doHandshake13 sparams ctx chosenVersion usedCipher exts usedHash clientKeyShare 
         let earlyDataExtension
               | rtt0OK = Just $ ExtensionRaw extensionID_EarlyData $ extensionEncode (EarlyDataIndication Nothing)
               | otherwise = Nothing
-        let extensions = catMaybes [earlyDataExtension, groupExtension, sniExtension] ++ protoExt
-        loadPacket13 ctx $ Handshake13 [EncryptedExtensions13 extensions]
+        let extensions = sharedHelloExtensions (serverShared sparams)
+                      ++ catMaybes [earlyDataExtension
+                                   ,groupExtension
+                                   ,sniExtension
+                                   ]
+                      ++ protoExt
+        extensions' <- liftIO $ onEncryptedExtensionsCreating (serverHooks sparams) extensions
+        loadPacket13 ctx $ Handshake13 [EncryptedExtensions13 extensions']
 
     sendNewSessionTicket applicationSecret sfSentTime = when sendNST $ do
         cfRecvTime <- getCurrentTimeFromBase
@@ -977,8 +1001,8 @@ expectCertVerify sparams ctx hChCc (CertVerify13 sigAlg sig) = liftIO $ do
     clientCertVerify sparams ctx certs verif
 expectCertVerify _ _ _ hs = unexpected (show hs) (Just "certificate verify 13")
 
-helloRetryRequest :: MonadIO m => ServerParams -> Context -> Version -> Cipher -> [ExtensionRaw] -> [Group] -> Session -> m ()
-helloRetryRequest sparams ctx chosenVersion usedCipher exts serverGroups clientSession = liftIO $ do
+helloRetryRequest :: ServerParams -> Context -> Version -> Cipher -> [ExtensionRaw] -> [Group] -> Session -> IO ()
+helloRetryRequest sparams ctx chosenVersion usedCipher exts serverGroups clientSession = do
     twice <- usingState_ ctx getTLS13HRR
     when twice $
         throwCore $ Error_Protocol ("Hello retry not allowed again", True, HandshakeFailure)
@@ -1049,21 +1073,22 @@ findHighestVersionFrom13 clientVersions serverVersions = case svs `intersect` cv
     cvs = sortOn Down clientVersions
 
 applicationProtocol :: Context -> [ExtensionRaw] -> ServerParams -> IO [ExtensionRaw]
-applicationProtocol ctx exts sparams
-    | clientALPNSuggest = do
-        suggest <- usingState_ ctx getClientALPNSuggest
-        case (onALPNClientSuggest $ serverHooks sparams, suggest) of
-            (Just io, Just protos) -> do
-                proto <- io protos
-                usingState_ ctx $ do
-                    setExtensionALPN True
-                    setNegotiatedProtocol proto
-                return [ ExtensionRaw extensionID_ApplicationLayerProtocolNegotiation
-                                        (extensionEncode $ ApplicationLayerProtocolNegotiation [proto]) ]
-            (_, _)                  -> return []
-    | otherwise = return []
-  where
-    clientALPNSuggest = isJust $ extensionLookup extensionID_ApplicationLayerProtocolNegotiation exts
+applicationProtocol ctx exts sparams = do
+    -- ALPN (Application Layer Protocol Negotiation)
+    case extensionLookup extensionID_ApplicationLayerProtocolNegotiation exts >>= extensionDecode MsgTClientHello of
+        Nothing -> return []
+        Just (ApplicationLayerProtocolNegotiation protos) -> do
+            case onALPNClientSuggest $ serverHooks sparams of
+                Just io -> do
+                    proto <- io protos
+                    when (proto == "") $
+                        throwCore $ Error_Protocol ("no supported application protocols", True, NoApplicationProtocol)
+                    usingState_ ctx $ do
+                        setExtensionALPN True
+                        setNegotiatedProtocol proto
+                    return [ ExtensionRaw extensionID_ApplicationLayerProtocolNegotiation
+                                            (extensionEncode $ ApplicationLayerProtocolNegotiation [proto]) ]
+                _ -> return []
 
 credentialsFindForSigning13 :: [HashAndSignatureAlgorithm] -> Credentials -> Maybe (Credential, HashAndSignatureAlgorithm)
 credentialsFindForSigning13 hss0 creds = loop hss0
@@ -1149,10 +1174,12 @@ postHandshakeAuthServerWith sparams ctx h@(Certificate13 certCtx certs _ext) = d
     processHandshake13 ctx certReq
     processHandshake13 ctx h
 
-    (usedHash, _, applicationSecretN) <- getRxState ctx
+    (usedHash, _, level, applicationSecretN) <- getRxState ctx
+    unless (level == CryptApplicationSecret) $
+        throwCore $ Error_Protocol ("tried post-handshake authentication without application traffic secret", True, InternalError)
 
     let expectFinished hChBeforeCf (Finished13 verifyData) = do
-            checkFinished usedHash applicationSecretN hChBeforeCf verifyData
+            checkFinished ctx usedHash applicationSecretN hChBeforeCf verifyData
             void $ restoreHState ctx baseHState
         expectFinished _ hs = unexpected (show hs) (Just "finished 13")
 
@@ -1167,3 +1194,7 @@ postHandshakeAuthServerWith sparams ctx h@(Certificate13 certCtx certs _ext) = d
 
 postHandshakeAuthServerWith _ _ _ =
     throwCore $ Error_Protocol ("unexpected handshake message received in postHandshakeAuthServerWith", True, UnexpectedMessage)
+
+contextSync :: Context -> ServerState -> IO ()
+contextSync ctx ctl = case ctxHandshakeSync ctx of
+    HandshakeSync _ sync -> sync ctx ctl

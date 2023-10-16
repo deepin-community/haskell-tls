@@ -1,5 +1,4 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE CPP #-}
 -- |
 -- Module      : Network.TLS.Record.State
 -- License     : BSD-style
@@ -9,6 +8,8 @@
 --
 module Network.TLS.Record.State
     ( CryptState(..)
+    , CryptLevel(..)
+    , HasCryptLevel(..)
     , MacState(..)
     , RecordOptions(..)
     , RecordState(..)
@@ -37,6 +38,7 @@ import Network.TLS.Packet
 import Network.TLS.MAC
 import Network.TLS.Util
 import Network.TLS.Imports
+import Network.TLS.Types
 
 import qualified Data.ByteString as B
 
@@ -57,9 +59,24 @@ data RecordOptions = RecordOptions
     , recordTLS13 :: Bool                     -- TLS13 record processing
     }
 
+-- | TLS encryption level.
+data CryptLevel
+    = CryptInitial            -- ^ Unprotected traffic
+    | CryptMasterSecret       -- ^ Protected with master secret (TLS < 1.3)
+    | CryptEarlySecret        -- ^ Protected with early traffic secret (TLS 1.3)
+    | CryptHandshakeSecret    -- ^ Protected with handshake traffic secret (TLS 1.3)
+    | CryptApplicationSecret  -- ^ Protected with application traffic secret (TLS 1.3)
+    deriving (Eq,Show)
+
+class HasCryptLevel a where getCryptLevel :: proxy a -> CryptLevel
+instance HasCryptLevel EarlySecret where getCryptLevel _ = CryptEarlySecret
+instance HasCryptLevel HandshakeSecret where getCryptLevel _ = CryptHandshakeSecret
+instance HasCryptLevel ApplicationSecret where getCryptLevel _ = CryptApplicationSecret
+
 data RecordState = RecordState
     { stCipher      :: Maybe Cipher
     , stCompression :: Compression
+    , stCryptLevel  :: !CryptLevel
     , stCryptState  :: !CryptState
     , stMacState    :: !MacState
     } deriving (Show)
@@ -94,9 +111,7 @@ getRecordVersion = recordVersion <$> getRecordOptions
 instance MonadState RecordState RecordM where
     put x = RecordM $ \_  _  -> Right ((), x)
     get   = RecordM $ \_  st -> Right (st, st)
-#if MIN_VERSION_mtl(2,1,0)
     state f = RecordM $ \_ st -> Right (f st)
-#endif
 
 instance MonadError TLSError RecordM where
     throwError e   = RecordM $ \_ _ -> Left e
@@ -109,6 +124,7 @@ newRecordState :: RecordState
 newRecordState = RecordState
     { stCipher      = Nothing
     , stCompression = nullCompression
+    , stCryptLevel  = CryptInitial
     , stCryptState  = CryptState BulkStateUninitialized B.empty B.empty
     , stMacState    = MacState 0
     }

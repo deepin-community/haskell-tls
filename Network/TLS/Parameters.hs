@@ -397,6 +397,14 @@ data Shared = Shared
       --
       -- See the default value of 'ValidationCache'.
     , sharedValidationCache :: ValidationCache
+      -- | Additional extensions to be sent during the Hello sequence.
+      --
+      -- For a client this is always included in message ClientHello.  For a
+      -- server, this is sent in messages ServerHello or EncryptedExtensions
+      -- based on the TLS version.
+      --
+      -- Default: @[]@
+    , sharedHelloExtensions :: [ExtensionRaw]
     }
 
 instance Show Shared where
@@ -407,6 +415,7 @@ instance Default Shared where
             , sharedSessionManager  = noSessionManager
             , sharedCAStore         = mempty
             , sharedValidationCache = def
+            , sharedHelloExtensions = []
             }
 
 -- | Group usage callback possible return values.
@@ -598,9 +607,16 @@ data ServerHooks = ServerHooks
       -- | Allow the server to choose an application layer protocol
       --   suggested from the client through the ALPN
       --   (Application Layer Protocol Negotiation) extensions.
+      --   If the server supports no protocols that the client advertises
+      --   an empty 'ByteString' should be returned.
       --
       -- Default: 'Nothing'
     , onALPNClientSuggest     :: Maybe ([B.ByteString] -> IO B.ByteString)
+      -- | Allow to modify extensions to be sent in EncryptedExtensions
+      --  of TLS 1.3.
+      --
+      -- Default: 'return . id'
+    , onEncryptedExtensionsCreating :: [ExtensionRaw] -> IO [ExtensionRaw]
     }
 
 defaultServerHooks :: ServerHooks
@@ -611,6 +627,7 @@ defaultServerHooks = ServerHooks
     , onServerNameIndication = \_ -> return mempty
     , onNewHandshake         = \_ -> return True
     , onALPNClientSuggest    = Nothing
+    , onEncryptedExtensionsCreating = return . id
     }
 
 instance Show ServerHooks where
