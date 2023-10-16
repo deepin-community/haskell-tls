@@ -9,7 +9,6 @@
 --
 -- the Struct module contains all definitions and values of the TLS protocol
 --
-{-# LANGUAGE CPP #-}
 module Network.TLS.Struct
     ( Version(..)
     , ConnectionEnd(..)
@@ -67,10 +66,6 @@ import Network.TLS.Types
 import Network.TLS.Crypto
 import Network.TLS.Util.Serialization
 import Network.TLS.Imports
-#if MIN_VERSION_mtl(2,2,1)
-#else
-import Control.Monad.Error
-#endif
 
 data ConnectionEnd = ConnectionServer | ConnectionClient
 data CipherType = CipherStream | CipherBlock | CipherAEAD
@@ -113,7 +108,7 @@ data CertificateType =
 -- via the client certificate request callback.
 --
 lastSupportedCertificateType :: CertificateType
-lastSupportedCertificateType = CertificateType_DSS_Sign
+lastSupportedCertificateType = CertificateType_ECDSA_Sign
 
 
 data HashAlgorithm =
@@ -173,13 +168,6 @@ data TLSError =
     | Error_Packet_Parsing String
     deriving (Eq, Show, Typeable)
 
-#if MIN_VERSION_mtl(2,2,1)
-#else
-instance Error TLSError where
-    noMsg  = Error_Misc ""
-    strMsg = Error_Misc
-#endif
-
 instance Exception TLSError
 
 -- | TLS Exceptions related to bad user usage or
@@ -208,8 +196,11 @@ newtype ClientRandom = ClientRandom { unClientRandom :: ByteString } deriving (S
 newtype Session = Session (Maybe SessionID) deriving (Show, Eq)
 
 type FinishedData = ByteString
+
+-- | Identifier of a TLS extension.
 type ExtensionID  = Word16
 
+-- | The raw content of a TLS extension.
 data ExtensionRaw = ExtensionRaw ExtensionID ByteString
     deriving (Eq)
 
@@ -252,6 +243,7 @@ showEID 0x30 = "OidFilters"
 showEID 0x31 = "PostHandshakeAuth"
 showEID 0x32 = "SignatureAlgorithmsCert"
 showEID 0x33 = "KeyShare"
+showEID 0x39 = "QuicTransportParameters"
 showEID 0xff01 = "SecureRenegotiation"
 showEID 0xffa5 = "QuicTransportParameters"
 showEID x      = show x

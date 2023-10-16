@@ -2,7 +2,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE CPP #-}
 -- |
 -- Module      : Network.TLS.Handshake.State
 -- License     : BSD-style
@@ -190,9 +189,7 @@ newtype HandshakeM a = HandshakeM { runHandshakeM :: State HandshakeState a }
 instance MonadState HandshakeState HandshakeM where
     put x = HandshakeM (put x)
     get   = HandshakeM get
-#if MIN_VERSION_mtl(2,1,0)
     state f = HandshakeM (state f)
-#endif
 
 -- create a new empty handshake state
 newEmptyHandshake :: Version -> ClientRandom -> HandshakeState
@@ -284,7 +281,7 @@ getNegotiatedGroup = gets hstNegotiatedGroup
 data HandshakeMode13 =
       -- | Full handshake is used.
       FullHandshake
-      -- | Full handshake is used with hello retry reuest.
+      -- | Full handshake is used with hello retry request.
     | HelloRetryRequest
       -- | Server authentication is skipped.
     | PreSharedKey
@@ -482,12 +479,14 @@ computeKeyBlock hst masterSecret ver cc = (pendingTx, pendingRx)
         pendingTx = RecordState
                   { stCryptState  = if cc == ClientRole then cstClient else cstServer
                   , stMacState    = if cc == ClientRole then msClient else msServer
+                  , stCryptLevel  = CryptMasterSecret
                   , stCipher      = Just cipher
                   , stCompression = hstPendingCompression hst
                   }
         pendingRx = RecordState
                   { stCryptState  = if cc == ClientRole then cstServer else cstClient
                   , stMacState    = if cc == ClientRole then msServer else msClient
+                  , stCryptLevel  = CryptMasterSecret
                   , stCipher      = Just cipher
                   , stCompression = hstPendingCompression hst
                   }

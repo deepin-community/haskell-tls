@@ -1,8 +1,9 @@
-haskell-tls (1.5.4-deepin1) unstable; urgency=medium
+haskell-tls (1.5.8-1) unstable; urgency=medium
 
-  * Rebuild
+  * Declare compliance with Debian policy 4.6.1
+  * New upstream release
 
- -- Deepin Packages Builder <packages@deepin.org>  Mon, 14 Nov 2022 17:42:07 +0800
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Wed, 27 Jul 2022 13:49:54 +0300
 
 haskell-tls (1.5.4-1) unstable; urgency=medium
 

@@ -74,17 +74,21 @@ import Time.System
 
 import Control.Concurrent.MVar
 import Control.Monad.State.Strict
+import Data.IORef (writeIORef)
 
 ----------------------------------------------------------------
 
 makeFinished :: MonadIO m => Context -> Hash -> ByteString -> m Handshake13
-makeFinished ctx usedHash baseKey =
-    Finished13 . makeVerifyData usedHash baseKey <$> transcriptHash ctx
+makeFinished ctx usedHash baseKey = do
+    finished <- makeVerifyData usedHash baseKey <$> transcriptHash ctx
+    liftIO $ writeIORef (ctxFinished ctx) (Just finished)
+    pure $ Finished13 finished
 
-checkFinished :: MonadIO m => Hash -> ByteString -> ByteString -> ByteString -> m ()
-checkFinished usedHash baseKey hashValue verifyData = do
+checkFinished :: MonadIO m => Context -> Hash -> ByteString -> ByteString -> ByteString -> m ()
+checkFinished ctx usedHash baseKey hashValue verifyData = do
     let verifyData' = makeVerifyData usedHash baseKey hashValue
     unless (verifyData' == verifyData) $ decryptError "cannot verify finished"
+    liftIO $ writeIORef (ctxPeerFinished ctx) (Just verifyData)
 
 makeVerifyData :: Hash -> ByteString -> ByteString -> ByteString
 makeVerifyData usedHash baseKey = hmac usedHash finishedKey
@@ -193,7 +197,7 @@ replacePSKBinder pskz binder = identities `B.append` binders
 
 ----------------------------------------------------------------
 
-sendChangeCipherSpec13 :: Context -> PacketFlightM ()
+sendChangeCipherSpec13 :: Monoid b => Context -> PacketFlightM b ()
 sendChangeCipherSpec13 ctx = do
     sent <- usingHState ctx $ do
                 b <- getCCS13Sent
@@ -370,7 +374,7 @@ getHandshake13 ctx = RecvHandshake13M $ do
   where
     found h hs = liftIO (processHandshake13 ctx h) >> put hs >> return h
     recvLoop = do
-        epkt <- recvPacket13 ctx
+        epkt <- liftIO (recvPacket13 ctx)
         case epkt of
             Right (Handshake13 [])     -> error "invalid recvPacket13 result"
             Right (Handshake13 (h:hs)) -> found h hs

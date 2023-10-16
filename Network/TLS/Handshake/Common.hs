@@ -21,6 +21,8 @@ module Network.TLS.Handshake.Common
     , storePrivInfo
     , isSupportedGroup
     , checkSupportedGroup
+    , errorToAlert
+    , errorToAlertMessage
     ) where
 
 import qualified Data.ByteString as B
@@ -49,6 +51,7 @@ import Network.TLS.Imports
 
 import Control.Monad.State.Strict
 import Control.Exception (IOException, handle, fromException, throwIO)
+import Data.IORef (writeIORef)
 
 handshakeFailed :: TLSError -> IO ()
 handshakeFailed err = throwIO $ HandshakeFailed err
@@ -73,6 +76,14 @@ errorToAlert (Error_Protocol (_, _, ad))   = [(AlertLevel_Fatal, ad)]
 errorToAlert (Error_Packet_unexpected _ _) = [(AlertLevel_Fatal, UnexpectedMessage)]
 errorToAlert (Error_Packet_Parsing _)      = [(AlertLevel_Fatal, DecodeError)]
 errorToAlert _                             = [(AlertLevel_Fatal, InternalError)]
+
+-- | Return the message that a TLS endpoint can add to its local log for the
+-- specified library error.
+errorToAlertMessage :: TLSError -> String
+errorToAlertMessage (Error_Protocol (msg, _, _))    = msg
+errorToAlertMessage (Error_Packet_unexpected msg _) = msg
+errorToAlertMessage (Error_Packet_Parsing msg)      = msg
+errorToAlertMessage e                               = show e
 
 unexpected :: MonadIO m => String -> Maybe String -> m a
 unexpected msg expected = throwCore $ Error_Packet_unexpected msg (maybe "" (" expected: " ++) expected)
@@ -117,6 +128,7 @@ sendChangeCipherAndFinish ctx role = do
     liftIO $ contextFlush ctx
     cf <- usingState_ ctx getVersion >>= \ver -> usingHState ctx $ getHandshakeDigest ver role
     sendPacket ctx (Handshake [Finished cf])
+    writeIORef (ctxFinished ctx) $ Just cf
     liftIO $ contextFlush ctx
 
 recvChangeCipherAndFinish :: Context -> IO ()
@@ -215,7 +227,8 @@ extensionLookup toFind = fmap (\(ExtensionRaw _ content) -> content)
 -- | Store the specified keypair.  Whether the public key and private key
 -- actually match is left for the peer to discover.  We're not presently
 -- burning  CPU to detect that misconfiguration.  We verify only that the
--- types of keys match.
+-- types of keys match and that it does not include an algorithm that would
+-- not be safe.
 storePrivInfo :: MonadIO m
               => Context
               -> CertificateChain

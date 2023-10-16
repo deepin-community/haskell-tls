@@ -1,4 +1,6 @@
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 -- |
 -- Module      : Network.TLS.Context.Internal
 -- License     : BSD-style
@@ -35,6 +37,7 @@ module Network.TLS.Context.Internal
     , contextClose
     , contextSend
     , contextRecv
+    , updateRecordLayer
     , updateMeasure
     , withMeasure
     , withReadLock
@@ -62,31 +65,35 @@ module Network.TLS.Context.Internal
     , addCertRequest13
     , getCertRequest13
     , decideRecordVersion
+
+    -- * Misc
+    , HandshakeSync(..)
     ) where
 
 import Network.TLS.Backend
-import Network.TLS.Extension
 import Network.TLS.Cipher
-import Network.TLS.Struct
-import Network.TLS.Struct13
 import Network.TLS.Compression (Compression)
-import Network.TLS.State
+import Network.TLS.Extension
+import Network.TLS.Handshake.Control
 import Network.TLS.Handshake.State
 import Network.TLS.Hooks
-import Network.TLS.Record.State
-import Network.TLS.Parameters
-import Network.TLS.Measurement
 import Network.TLS.Imports
+import Network.TLS.Measurement
+import Network.TLS.Parameters
+import Network.TLS.Record.Layer
+import Network.TLS.Record.State
+import Network.TLS.State
+import Network.TLS.Struct
+import Network.TLS.Struct13
 import Network.TLS.Types
 import Network.TLS.Util
-import qualified Data.ByteString as B
 
 import Control.Concurrent.MVar
+import Control.Exception (throwIO)
 import Control.Monad.State.Strict
-import Control.Exception (throwIO, Exception())
+import qualified Data.ByteString as B
 import Data.IORef
 import Data.Tuple
-
 
 -- | Information related to a running context, e.g. current cipher
 data Information = Information
@@ -103,7 +110,7 @@ data Information = Information
     } deriving (Show,Eq)
 
 -- | A TLS Context keep tls specific state, parameters and backend information.
-data Context = Context
+data Context = forall bytes . Monoid bytes => Context
     { ctxConnection       :: Backend   -- ^ return the backend object associated with this context
     , ctxSupported        :: Supported
     , ctxShared           :: Shared
@@ -115,6 +122,7 @@ data Context = Context
     , ctxSSLv2ClientHello :: IORef Bool    -- ^ enable the reception of compatibility SSLv2 client hello.
                                            -- the flag will be set to false regardless of its initial value
                                            -- after the first packet received.
+    , ctxFragmentSize     :: Maybe Int        -- ^ maximum size of plaintext fragments
     , ctxTxState          :: MVar RecordState -- ^ current tx state
     , ctxRxState          :: MVar RecordState -- ^ current rx state
     , ctxHandshake        :: MVar (Maybe HandshakeState) -- ^ optional handshake state
@@ -130,7 +138,19 @@ data Context = Context
     , ctxPendingActions   :: IORef [PendingAction]
     , ctxCertRequests     :: IORef [Handshake13]  -- ^ pending PHA requests
     , ctxKeyLogger        :: String -> IO ()
+    , ctxRecordLayer      :: RecordLayer bytes
+    , ctxHandshakeSync    :: HandshakeSync
+    , ctxQUICMode         :: Bool
+    , ctxFinished         :: IORef (Maybe FinishedData)
+    , ctxPeerFinished     :: IORef (Maybe FinishedData)
     }
+
+data HandshakeSync = HandshakeSync (Context -> ClientState -> IO ())
+                                   (Context -> ServerState -> IO ())
+
+updateRecordLayer :: Monoid bytes => RecordLayer bytes -> Context -> Context
+updateRecordLayer recordLayer Context{..} =
+    Context { ctxRecordLayer = recordLayer, .. }
 
 data Established = NotEstablished
                  | EarlyDataAllowed Int    -- remaining 0-RTT bytes allowed
@@ -145,9 +165,7 @@ data PendingAction
       -- ^ pending action taking transcript hash up to preceding message
 
 updateMeasure :: Context -> (Measurement -> Measurement) -> IO ()
-updateMeasure ctx f = do
-    x <- readIORef (ctxMeasurement ctx)
-    writeIORef (ctxMeasurement ctx) $! f x
+updateMeasure ctx = modifyIORef' (ctxMeasurement ctx)
 
 withMeasure :: Context -> (Measurement -> IO a) -> IO a
 withMeasure ctx f = readIORef (ctxMeasurement ctx) >>= f
@@ -174,7 +192,7 @@ contextGetInformation ctx = do
                             if ver == Just TLS13 then Just (hstTLS13HandshakeMode st) else Nothing,
                             hstNegotiatedGroup st)
                 Nothing -> (Nothing, False, Nothing, Nothing, Nothing, Nothing)
-    (cipher,comp) <- failOnEitherError $ runRxState ctx $ gets $ \st -> (stCipher st, stCompression st)
+    (cipher,comp) <- readMVar (ctxRxState ctx) <&> \st -> (stCipher st, stCompression st)
     let accepted = case hstate of
             Just st -> hstTLS13RTT0Status st == RTT0Accepted
             Nothing -> False
@@ -215,7 +233,7 @@ setEstablished ctx = writeIORef (ctxEstablished_ ctx)
 withLog :: Context -> (Logging -> IO ()) -> IO ()
 withLog ctx f = ctxWithHooks ctx (f . hookLogging)
 
-throwCore :: (MonadIO m, Exception e) => e -> m a
+throwCore :: MonadIO m => TLSError -> m a
 throwCore = liftIO . throwIO
 
 failOnEitherError :: MonadIO m => m (Either TLSError a) -> m a
@@ -252,9 +270,9 @@ restoreHState :: Context
 restoreHState ctx = restoreMVar (ctxHandshake ctx)
 
 decideRecordVersion :: Context -> IO (Version, Bool)
-decideRecordVersion ctx = do
-    ver <- usingState_ ctx (getVersionWithDefault $ maximum $ supportedVersions $ ctxSupported ctx)
-    hrr <- usingState_ ctx getTLS13HRR
+decideRecordVersion ctx = usingState_ ctx $ do
+    ver <- getVersionWithDefault (maximum $ supportedVersions $ ctxSupported ctx)
+    hrr <- getTLS13HRR
     -- For TLS 1.3, ver' is only used in ClientHello.
     -- The record version of the first ClientHello SHOULD be TLS 1.0.
     -- The record version of the second ClientHello MUST be TLS 1.2.

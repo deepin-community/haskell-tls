@@ -1,5 +1,5 @@
 Name:                tls
-Version:             1.5.4
+Version:             1.5.8
 Description:
    Native Haskell TLS and SSL protocol implementation for server and client.
    .
@@ -17,12 +17,12 @@ License:             BSD3
 License-file:        LICENSE
 Copyright:           Vincent Hanquez <vincent@snarc.org>
 Author:              Vincent Hanquez <vincent@snarc.org>
-Maintainer:          Vincent Hanquez <vincent@snarc.org>
+Maintainer:          Kazu Yamamoto <kazu@iij.ad.jp>
 Synopsis:            TLS/SSL protocol native implementation (Server and Client)
 Build-Type:          Simple
 Category:            Network
 stability:           experimental
-Cabal-Version:       >=1.8
+Cabal-Version:       >=1.10
 Homepage:            http://github.com/vincenthz/hs-tls
 extra-source-files:  Tests/*.hs
                      CHANGELOG.md
@@ -40,15 +40,16 @@ Flag hans
   Default:           False
 
 Library
+  Default-Language:  Haskell2010
   Build-Depends:     base >= 4.9 && < 5
-                   , mtl >= 2
+                   , mtl >= 2.2.1
                    , transformers
                    , cereal >= 0.5.3
                    , bytestring
                    , data-default-class
                    -- crypto related
                    , memory >= 0.14.6
-                   , cryptonite >= 0.25
+                   , cryptonite >= 0.27
                    -- certificate related
                    , asn1-types >= 0.2.0
                    , asn1-encoding
@@ -70,6 +71,7 @@ Library
                      Network.TLS.Extra
                      Network.TLS.Extra.Cipher
                      Network.TLS.Extra.FFDHE
+                     Network.TLS.QUIC
   other-modules:     Network.TLS.Cap
                      Network.TLS.Struct
                      Network.TLS.Struct13
@@ -85,14 +87,15 @@ Library
                      Network.TLS.ErrT
                      Network.TLS.Extension
                      Network.TLS.Handshake
+                     Network.TLS.Handshake.Certificate
+                     Network.TLS.Handshake.Client
                      Network.TLS.Handshake.Common
                      Network.TLS.Handshake.Common13
-                     Network.TLS.Handshake.Certificate
+                     Network.TLS.Handshake.Control
                      Network.TLS.Handshake.Key
-                     Network.TLS.Handshake.Client
-                     Network.TLS.Handshake.Server
                      Network.TLS.Handshake.Process
                      Network.TLS.Handshake.Random
+                     Network.TLS.Handshake.Server
                      Network.TLS.Handshake.Signature
                      Network.TLS.Handshake.State
                      Network.TLS.Handshake.State13
@@ -107,17 +110,18 @@ Library
                      Network.TLS.Parameters
                      Network.TLS.PostHandshake
                      Network.TLS.Record
-                     Network.TLS.Record.Types
-                     Network.TLS.Record.Engage
                      Network.TLS.Record.Disengage
+                     Network.TLS.Record.Engage
+                     Network.TLS.Record.Layer
+                     Network.TLS.Record.Reading
+                     Network.TLS.Record.Writing
                      Network.TLS.Record.State
+                     Network.TLS.Record.Types
                      Network.TLS.RNG
                      Network.TLS.State
                      Network.TLS.Session
                      Network.TLS.Sending
-                     Network.TLS.Sending13
                      Network.TLS.Receiving
-                     Network.TLS.Receiving13
                      Network.TLS.Util
                      Network.TLS.Util.ASN1
                      Network.TLS.Util.Serialization
@@ -129,6 +133,7 @@ Library
     cpp-options:     -DSSLV2_COMPATIBLE
 
 Test-Suite test-tls
+  Default-Language:  Haskell2010
   type:              exitcode-stdio-1.0
   hs-source-dirs:    Tests
   Main-is:           Tests.hs
@@ -154,6 +159,7 @@ Test-Suite test-tls
   ghc-options:       -Wall -fno-warn-unused-imports
 
 Benchmark bench-tls
+  Default-Language:  Haskell2010
   hs-source-dirs:    Benchmarks Tests
   Main-Is:           Benchmarks.hs
   type:              exitcode-stdio-1.0

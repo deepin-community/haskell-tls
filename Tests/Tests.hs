@@ -80,12 +80,14 @@ runTLSPipePredicate :: (ClientParams, ServerParams) -> (Maybe Information -> Boo
 runTLSPipePredicate params p = runTLSPipe params tlsServer tlsClient
   where tlsServer ctx queue = do
             handshake ctx
+            checkCtxFinished ctx
             checkInfoPredicate ctx
             d <- recvData ctx
             writeChan queue [d]
             bye ctx
         tlsClient queue ctx = do
             handshake ctx
+            checkCtxFinished ctx
             checkInfoPredicate ctx
             d <- readChan queue
             sendData ctx (L.fromChunks [d])
@@ -109,12 +111,14 @@ runTLSPipeSimple13 params mode mEarlyData = runTLSPipe params tlsServer tlsClien
                     chunks <- replicateM (length ls) $ recvData ctx
                     (ls, ed) `assertEq` (map B.length chunks, B.concat chunks)
             d <- recvData ctx
+            checkCtxFinished ctx
             writeChan queue [d]
             minfo <- contextGetInformation ctx
             Just mode `assertEq` (minfo >>= infoTLS13HandshakeMode)
             bye ctx
         tlsClient queue ctx = do
             handshake ctx
+            checkCtxFinished ctx
             d <- readChan queue
             sendData ctx (L.fromChunks [d])
             minfo <- contextGetInformation ctx
@@ -132,12 +136,14 @@ runTLSPipeCapture13 params = do
   where tlsServer ref ctx queue = do
             installHook ctx ref
             handshake ctx
+            checkCtxFinished ctx
             d <- recvData ctx
             writeChan queue [d]
             bye ctx
         tlsClient ref queue ctx = do
             installHook ctx ref
             handshake ctx
+            checkCtxFinished ctx
             d <- readChan queue
             sendData ctx (L.fromChunks [d])
             byeBye ctx
@@ -149,6 +155,7 @@ runTLSPipeSimpleKeyUpdate :: (ClientParams, ServerParams) -> PropertyM IO ()
 runTLSPipeSimpleKeyUpdate params = runTLSPipeN 3 params tlsServer tlsClient
   where tlsServer ctx queue = do
             handshake ctx
+            checkCtxFinished ctx
             d0 <- recvData ctx
             req <- generate $ elements [OneWay, TwoWay]
             _ <- updateKey ctx req
@@ -158,6 +165,7 @@ runTLSPipeSimpleKeyUpdate params = runTLSPipeN 3 params tlsServer tlsClient
             bye ctx
         tlsClient queue ctx = do
             handshake ctx
+            checkCtxFinished ctx
             d0 <- readChan queue
             sendData ctx (L.fromChunks [d0])
             d1 <- readChan queue
@@ -175,11 +183,13 @@ runTLSInitFailureGen params hsServer hsClient = do
     assertIsLeft sRes
   where tlsServer ctx = do
             _ <- hsServer ctx
+            checkCtxFinished ctx
             minfo <- contextGetInformation ctx
             byeBye ctx
             return $ "server success: " ++ show minfo
         tlsClient ctx = do
             _ <- hsClient ctx
+            checkCtxFinished ctx
             minfo <- contextGetInformation ctx
             byeBye ctx
             return $ "client success: " ++ show minfo
@@ -489,10 +499,16 @@ prop_handshake_hashsignatures = do
         serverParam' = serverParam { serverSupported = (serverSupported serverParam)
                                        { supportedHashSignatures = serverHashSigs }
                                    }
-        shouldFail = null (clientHashSigs `intersect` serverHashSigs)
+        commonHashSigs = clientHashSigs `intersect` serverHashSigs
+        shouldFail
+            | tls13     = all incompatibleWithDefaultCurve commonHashSigs
+            | otherwise = null commonHashSigs
     if shouldFail
         then runTLSInitFailure (clientParam',serverParam')
         else runTLSPipeSimple  (clientParam',serverParam')
+  where
+    incompatibleWithDefaultCurve (h, SignatureECDSA) = h /= HashSHA256
+    incompatibleWithDefaultCurve _                   = False
 
 -- Tests ability to use or ignore client "signature_algorithms" extension when
 -- choosing a server certificate.  Here peers allow DHE_RSA_AES128_SHA1 but
@@ -653,6 +669,44 @@ prop_handshake_srv_key_usage = do
         then runTLSPipeSimple  (clientParam,serverParam')
         else runTLSInitFailure (clientParam,serverParam')
 
+prop_handshake_ec :: PropertyM IO ()
+prop_handshake_ec = do
+    let versions   = [TLS10, TLS11, TLS12, TLS13]
+        ciphers    = [ cipher_ECDHE_ECDSA_AES256GCM_SHA384
+                     , cipher_ECDHE_ECDSA_AES128CBC_SHA
+                     , cipher_TLS13_AES128GCM_SHA256
+                     ]
+        sigGroups  = [P256]
+        ecdhGroups = [X25519, X448] -- always enabled, so no ECDHE failure
+        hashSignatures = [ (HashSHA256, SignatureECDSA)
+                         ]
+    clientVersion <- pick $ elements versions
+    (clientParam,serverParam) <- pick $ arbitraryPairParamsWithVersionsAndCiphers
+                                            ([clientVersion], versions)
+                                            (ciphers, ciphers)
+    clientGroups         <- pick $ sublistOf sigGroups
+    clientHashSignatures <- pick $ sublistOf hashSignatures
+    serverHashSignatures <- pick $ sublistOf hashSignatures
+    credentials          <- pick arbitraryCredentialsOfEachCurve
+    let clientParam' = clientParam { clientSupported = (clientSupported clientParam)
+                                       { supportedGroups = clientGroups ++ ecdhGroups
+                                       , supportedHashSignatures = clientHashSignatures
+                                       }
+                                   }
+        serverParam' = serverParam { serverSupported = (serverSupported serverParam)
+                                       { supportedGroups = sigGroups ++ ecdhGroups
+                                       , supportedHashSignatures = serverHashSignatures
+                                       }
+                                   , serverShared = (serverShared serverParam)
+                                       { sharedCredentials = Credentials credentials }
+                                   }
+        sigAlgs = map snd (clientHashSignatures `intersect` serverHashSignatures)
+        ecdsaDenied = (clientVersion < TLS13 && null clientGroups) ||
+                      (clientVersion >= TLS12 && SignatureECDSA `notElem` sigAlgs)
+    if ecdsaDenied
+        then runTLSInitFailure (clientParam',serverParam')
+        else runTLSPipeSimple  (clientParam',serverParam')
+
 prop_handshake_client_auth :: PropertyM IO ()
 prop_handshake_client_auth = do
     (clientParam,serverParam) <- pick arbitraryPairParams
@@ -703,6 +757,7 @@ prop_post_handshake_auth = do
             byeBye ctx
         hsServer ctx = do
             handshake ctx
+            checkCtxFinished ctx
             recvDataAssert ctx "request 1"
             _ <- requestCertificate ctx  -- single request
             sendData ctx "response 1"
@@ -712,6 +767,7 @@ prop_post_handshake_auth = do
             sendData ctx "response 2"
         hsClient ctx = do
             handshake ctx
+            checkCtxFinished ctx
             sendData ctx "request 1"
             recvDataAssert ctx "response 1"
             sendData ctx "request 2"
@@ -800,6 +856,7 @@ prop_handshake_alpn = do
     runTLSPipe params' tlsServer tlsClient
   where tlsServer ctx queue = do
             handshake ctx
+            checkCtxFinished ctx
             proto <- getNegotiatedProtocol ctx
             Just "h2" `assertEq` proto
             d <- recvData ctx
@@ -807,6 +864,7 @@ prop_handshake_alpn = do
             bye ctx
         tlsClient queue ctx = do
             handshake ctx
+            checkCtxFinished ctx
             proto <- getNegotiatedProtocol ctx
             Just "h2" `assertEq` proto
             d <- readChan queue
@@ -831,6 +889,7 @@ prop_handshake_sni = do
     Just (Just serverName) `assertEq` receivedName
   where tlsServer ctx queue = do
             handshake ctx
+            checkCtxFinished ctx
             sni <- getClientSNI ctx
             Just serverName `assertEq` sni
             d <- recvData ctx
@@ -838,6 +897,7 @@ prop_handshake_sni = do
             bye ctx
         tlsClient queue ctx = do
             handshake ctx
+            checkCtxFinished ctx
             sni <- getClientSNI ctx
             Just serverName `assertEq` sni
             d <- readChan queue
@@ -861,11 +921,13 @@ prop_handshake_renegotiation = do
         else runTLSPipe (cparams, sparams') tlsServer tlsClient
   where tlsServer ctx queue = do
             hsServer ctx
+            checkCtxFinished ctx
             d <- recvData ctx
             writeChan queue [d]
             bye ctx
         tlsClient queue ctx = do
             hsClient ctx
+            checkCtxFinished ctx
             d <- readChan queue
             sendData ctx (L.fromChunks [d])
             byeBye ctx
@@ -895,12 +957,14 @@ prop_thread_safety = do
     runTLSPipe params tlsServer tlsClient
   where tlsServer ctx queue = do
             handshake ctx
+            checkCtxFinished ctx
             runReaderWriters ctx "client-value" "server-value"
             d <- recvData ctx
             writeChan queue [d]
             bye ctx
         tlsClient queue ctx = do
             handshake ctx
+            checkCtxFinished ctx
             runReaderWriters ctx "server-value" "client-value"
             d <- readChan queue
             sendData ctx (L.fromChunks [d])
@@ -925,6 +989,15 @@ recvDataAssert :: Context -> C8.ByteString -> IO ()
 recvDataAssert ctx expected = do
     got <- recvData ctx
     assertEq expected got
+
+checkCtxFinished :: Context -> IO ()
+checkCtxFinished ctx = do
+    ctxFinished <- getFinished ctx
+    unless (isJust ctxFinished) $
+        fail "unexpected ctxFinished"
+    ctxPeerFinished <- getPeerFinished ctx
+    unless (isJust ctxPeerFinished) $
+        fail "unexpected ctxPeerFinished"
 
 main :: IO ()
 main = defaultMain $ testGroup "tls"
@@ -952,6 +1025,7 @@ main = defaultMain $ testGroup "tls"
             , testProperty "Hash and signatures" (monadicIO prop_handshake_hashsignatures)
             , testProperty "Cipher suites" (monadicIO prop_handshake_ciphersuites)
             , testProperty "Groups" (monadicIO prop_handshake_groups)
+            , testProperty "Elliptic curves" (monadicIO prop_handshake_ec)
             , testProperty "Certificate fallback (ciphers)" (monadicIO prop_handshake_cert_fallback)
             , testProperty "Certificate fallback (hash and signatures)" (monadicIO prop_handshake_cert_fallback_hs)
             , testProperty "Server key usage" (monadicIO prop_handshake_srv_key_usage)
